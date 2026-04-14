@@ -437,7 +437,7 @@
 
     if (cfg.strategyMode === 'discoveryEvolution' && dnaWorker) {
       // 1. Send single price to worker
-      dnaWorker.postMessage({ type: 'compute', price: price, config: parsedDnaConfig });
+      dnaWorker.postMessage({ type: 'compute', price: price, seq: tickSeq, config: parsedDnaConfig });
 
       // 2. Capture current metrics (safe defaults before worker has warmed up)
       const currentMetrics = lastMetrics || { currentRSI: 0, currentBBW: 0, currentStr: 0 };
@@ -785,8 +785,15 @@
             Math.abs(p.indicators.str - hitState.str) < 0.05
           );
 
-          if (match) match.count++;
-          else patternLibrary[sequence].push({ indicators: hitState, action, regime, count: 1 });
+          if (match) {
+            match.count++;
+          } else {
+            patternLibrary[sequence].push({ indicators: hitState, action, regime, count: 1 });
+            // Cap to prevent memory leak and slow .find() ops
+            if (patternLibrary[sequence].length > 50) {
+              patternLibrary[sequence].shift();
+            }
+          }
 
           updateDiscoveryUI(e.data.data);
         }
@@ -1017,7 +1024,7 @@
     updateSeqMasterUIVisibility();
     updateRealUI();
   }
-  function startWatchdog() { if (watchdogInterval) clearInterval(watchdogInterval); watchdogInterval = setInterval(() => { const now = Date.now(); if (wsState !== 'connected') return; if (lastTickProcessedAt > 0 && now - lastTickProcessedAt > WATCHDOG_TICK_TIMEOUT) { if (ws) ws.close(); scheduleReconnect(); } }, WATCHDOG_INTERVAL); }
+  function startWatchdog() { if (watchdogInterval) clearInterval(watchdogInterval); watchdogInterval = setInterval(() => { const now = Date.now(); if (wsState !== 'connected') return; if (lastTickProcessedAt > 0 && now - lastTickProcessedAt > WATCHDOG_TICK_TIMEOUT) { if (ws && ws.readyState !== WebSocket.CLOSED && ws.readyState !== WebSocket.CLOSING) ws.close(); scheduleReconnect(); } }, WATCHDOG_INTERVAL); }
   let subObserver = null, lastFlyoutNode = null;
   function setupFlyoutObserver() {
     if (flyoutObserver) return;
@@ -1051,7 +1058,7 @@
   }
 
   function processFlyout(flyout) {
-      const text = flyout.innerText;
+      const text = flyout.textContent || '';
 
       // Purchase confirmation
       if (text.includes("Contract bought") || text.includes("ID:") || text.includes("Reference ID") || text.includes("Reference no") || text.includes("Contract ID")) {
@@ -1091,7 +1098,7 @@
       // 2. Buffer PnL
       const pnlSpan = flyout.querySelector('[data-testid="dt_span"]');
       if (pnlSpan) {
-        const val = parseFloat(pnlSpan.innerText.replace(/[^-0-9.]/g, ''));
+        const val = parseFloat((pnlSpan.textContent || '').replace(/[^-0-9.]/g, ''));
         if (!isNaN(val)) lastSeenPnL = val;
       }
 
@@ -1175,6 +1182,7 @@
       simulateExternalClick(btn); lastRealTradeAt = Date.now();
       const signalToMark = signals.find(s => s.result === 'PENDING' && s.isReal);
       realTrades.push({ time: Date.now(), signal: side, side: buyLabel, result: 'PENDING', signalRef: signalToMark, startTickIndex: null, confirmTime: null });
+      if (realTrades.length > SESSION_HISTORY_CAP) realTrades.shift();
       realExecTimer = setTimeout(() => { if (['OPEN_PENDING', 'OPEN'].includes(realExecState)) { realExecState = 'RECOVERY'; realLockReason = 'TIMEOUT'; updateRealUI(); } }, cfg.realTimeoutMs);
     } catch (e) { realLockReason = 'ERR:' + e.message; updateRealUI(); setTimeout(() => { if (realExecState === 'OPEN_PENDING') { realExecState = 'IDLE'; realLockReason = ''; updateRealUI(); } }, 3000); }
   }
@@ -1182,7 +1190,7 @@
     for (let i = 0; i < 3; i++) {
       const btn = document.querySelector(SEL_PURCHASE_BTN);
       if (btn && btn.classList.contains(activeClass)) return true;
-      const target = Array.from(document.querySelectorAll(SEL_SIDE_BTNS)).find(b => b.innerText.includes(label));
+      const target = Array.from(document.querySelectorAll(SEL_SIDE_BTNS)).find(b => (b.textContent || '').includes(label));
       if (target) {
         simulateExternalClick(target);
         await new Promise(r => setTimeout(r, 150)); // Faster response
