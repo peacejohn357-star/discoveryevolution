@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "FIX4  3Tick Scalper – Step Index 100 Assistant",
+  "version": "1.0.0",
+  "description": "FIX4 Real-time tick signals, 1-min trend, S/R zones, and W/L tracking for Step Index 100 manual trading on dtrader.deriv.com",
+  "permissions": [],
+  "host_permissions": [
+    "https://dtrader.deriv.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://dtrader.deriv.com/*"],
+      "js": ["content.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["dnaWorker.js"],
+      "matches": ["https://dtrader.deriv.com/*"]
+    }
+  ],
+  "action": {
+    "default_title": "3Tick Scalper",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  }
+}
