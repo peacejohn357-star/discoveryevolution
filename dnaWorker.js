@@ -7,9 +7,10 @@ let lastDiscoveredStreakStart = "";
 // Rolling price buffer — content.js sends ONE price at a time
 const PRICE_BUF_MAX = 500;
 let rollingPrices = [];
+let rollingSeqs = [];
 
 self.onmessage = function(e) {
-    const { type, price, config } = e.data;
+    const { type, price, seq, config } = e.data;
 
     if (type === 'compute') {
         if (price === undefined || price === null) return;
@@ -18,7 +19,11 @@ self.onmessage = function(e) {
         rollingPrices.push(parseFloat(price));
         if (rollingPrices.length > PRICE_BUF_MAX) rollingPrices.shift();
 
+        rollingSeqs.push(seq !== undefined ? seq : 0);
+        if (rollingSeqs.length > PRICE_BUF_MAX) rollingSeqs.shift();
+
         const prices = rollingPrices; // Alias for all downstream functions
+        const seqs = rollingSeqs;
         if (prices.length < 50) return;
 
         // 1. Existing DNA Logic
@@ -71,7 +76,7 @@ self.onmessage = function(e) {
             data: metricsData
         });
 
-        discoverPatterns(prices, rsiArr, bbwArr, strainArr, regime);
+        discoverPatterns(prices, seqs, rsiArr, bbwArr, strainArr, regime);
         checkMicroTrap(prices, ema10Arr, roc2Arr);
     }
 };
@@ -320,7 +325,7 @@ function checkMicroTrap(prices, ema10Arr, roc2Arr) {
     }
 }
 
-function discoverPatterns(prices, rsiArr, bbwArr, strainArr, currentRegime) {
+function discoverPatterns(prices, seqs, rsiArr, bbwArr, strainArr, currentRegime) {
     if (prices.length < 50) return;
 
     // 1. Extract pure non-flat moves — mirrors content.js rollingDirections logic exactly
@@ -357,8 +362,8 @@ function discoverPatterns(prices, rsiArr, bbwArr, strainArr, currentRegime) {
     if (streakLen >= 5) {
         const actualStartIndex = moves[streakStartMoveIdx].idx;
 
-        // Create a stable ID using the price at the start of the streak (immune to array shifts)
-        const stableStreakID = prices[actualStartIndex].toString();
+        // Create a stable ID using the tick sequence at the start of the streak
+        const stableStreakID = seqs[actualStartIndex].toString();
 
         // Guard against re-registering the same streak
         if (stableStreakID === lastDiscoveredStreakStart) return;
