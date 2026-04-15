@@ -157,6 +157,190 @@
     };
   }
 
+  // ── 3-Scalp Indicator Calculations ─────────────────────────────────────────
+  // scalp_calcEMA: standard EMA over a price array
+  function scalp_calcEMA(prices, period) {
+    if (prices.length === 0) return [];
+    const k = 2 / (period + 1);
+    const out = [prices[0]];
+    for (let i = 1; i < prices.length; i++) {
+      out.push(prices[i] * k + out[i - 1] * (1 - k));
+    }
+    return out;
+  }
+
+  // scalp_calcBB: Bollinger Bands with EMA middle, period=12, 2 std devs
+  // Returns array of { mid, upper, lower } per tick
+  function scalp_calcBB(prices, period) {
+    const emas = scalp_calcEMA(prices, period);
+    const out = [];
+    for (let i = 0; i < prices.length; i++) {
+      if (i < period - 1) { out.push({ mid: emas[i], upper: emas[i], lower: emas[i] }); continue; }
+      const slice = prices.slice(i - period + 1, i + 1);
+      const mean = emas[i];
+      const variance = slice.reduce((a, b) => a + (b - mean) ** 2, 0) / period;
+      const std = Math.sqrt(variance);
+      out.push({ mid: mean, upper: mean + 2 * std, lower: mean - 2 * std });
+    }
+    return out;
+  }
+
+  // scalp_calcMACD: classic MACD (12,26,9)
+  // Returns array of { macd, signal, hist }
+  function scalp_calcMACD(prices, fast, slow, sig) {
+    const emaFast = scalp_calcEMA(prices, fast);
+    const emaSlow = scalp_calcEMA(prices, slow);
+    const macdLine = prices.map((_, i) => emaFast[i] - emaSlow[i]);
+    const sigLine = scalp_calcEMA(macdLine, sig);
+    return prices.map((_, i) => ({ macd: macdLine[i], signal: sigLine[i], hist: macdLine[i] - sigLine[i] }));
+  }
+
+  // scalp_calcSMI: Stochastic Momentum Index (8, 3, 3, 10)
+  // Parameters: lookback=8, smooth1=3, smooth2=3, signal=10
+  // Returns array of { smi, signal }
+  function scalp_calcSMI(prices, lookback, smooth1, smooth2, sigPeriod) {
+    const n = prices.length;
+    const raw = new Array(n).fill(0);
+    const rawD = new Array(n).fill(0); // denominator
+    for (let i = lookback - 1; i < n; i++) {
+      const slice = prices.slice(i - lookback + 1, i + 1);
+      const hh = Math.max(...slice);
+      const ll = Math.min(...slice);
+      const mid = (hh + ll) / 2;
+      raw[i] = prices[i] - mid;   // numerator: distance from midpoint
+      rawD[i] = (hh - ll) / 2;    // denominator: half range
+    }
+    // First EMA smoothing on numerator and denominator separately
+    const num1 = scalp_calcEMA(raw, smooth1);
+    const den1 = scalp_calcEMA(rawD, smooth1);
+    // Second EMA smoothing
+    const num2 = scalp_calcEMA(num1, smooth2);
+    const den2 = scalp_calcEMA(den1, smooth2);
+    // SMI = 100 * (num2 / (den2 + 0.0001)) to avoid /0
+    const smiLine = prices.map((_, i) => 100 * (num2[i] / (Math.abs(den2[i]) + 0.0001)));
+    // Signal line = EMA(smiLine, sigPeriod)
+    const sigLine = scalp_calcEMA(smiLine, sigPeriod);
+    return prices.map((_, i) => ({ smi: smiLine[i], signal: sigLine[i] }));
+  }
+
+  // scalp_calcROC: 1-min candle ROC(2): rate of change over 2 candles
+  function scalp_calcROC(closes, period) {
+    return closes.map((v, i) => i >= period ? v - closes[i - period] : 0);
+  }
+
+  // ─── Weather update: called on every 1-min candle close ──────────────────
+  function scalp_updateWeather() {
+    if (scalp1mCandles.length < 3) return; // need at least 3 closes for ROC(2)
+    const closes = scalp1mCandles.map(c => c.close);
+    const n = closes.length;
+    const roc = scalp_calcROC(closes, 2);
+    const currentROC = roc[n - 1];
+    const bbArr = scalp_calcBB(closes, Math.min(10, n));
+    const bbMid = bbArr[n - 1].mid;
+    const lastClose = closes[n - 1];
+
+    const bullish = currentROC > 0 && lastClose > bbMid;
+    const bearish = currentROC < 0 && lastClose < bbMid;
+    scalpWeather = bullish ? 'BULLISH' : (bearish ? 'BEARISH' : 'FLAT');
+
+    // Update UI badge
+    const el = document.getElementById('tt-scalp-weather');
+    if (el) {
+      el.textContent = scalpWeather;
+      el.style.color = scalpWeather === 'BULLISH' ? '#3ecf60' : (scalpWeather === 'BEARISH' ? '#e04040' : '#f0c040');
+    }
+  }
+
+  // ─── 3-Scalp tick evaluation ─────────────────────────────────────────────
+  function scalp_onTick(price) {
+    // Duplication lock — realExecState covers isTradeActive
+    if (realExecState !== 'IDLE') return;
+
+    // Weather gate
+    if (scalpWeather === 'FLAT') return;
+
+    // Need enough tick history for indicators
+    if (scalpTickPrices.length < 30) return;
+
+    const prices = scalpTickPrices;
+    const n = prices.length;
+
+    // Tick BB (12, EMA)
+    const bbPeriod = cfg.scalp_bbPeriod || 12;
+    const bbArr = scalp_calcBB(prices, bbPeriod);
+    const bb = bbArr[n - 1];
+
+    // BB squeeze guard: avoid flat markets
+    const minBbSpread = cfg.scalp_minBbSpread || 0.0;
+    if ((bb.upper - bb.lower) < minBbSpread) return;
+
+    // Tick MA (12, EMA) — same as bb.mid
+    const bbMid = bb.mid;
+
+    // Tick RSI (7 — faster for ultra-short scalping; configurable)
+    const rsiPeriod = cfg.scalp_rsiPeriod || 7;
+    const rsiArr = evo_calcRSI(prices, rsiPeriod);
+    const rsi = rsiArr[n - 1];
+
+    // Tick MACD (12, 26, 9)
+    if (prices.length < 35) return; // need enough for MACD(26)
+    const macdArr = scalp_calcMACD(prices, 12, 26, 9);
+    const macdNow = macdArr[n - 1];
+    const macdHistRising  = scalpPrevMacdHist !== null && macdNow.hist > scalpPrevMacdHist;
+    const macdHistFalling = scalpPrevMacdHist !== null && macdNow.hist < scalpPrevMacdHist;
+
+    // SMI (8, 3, 3, 10)
+    const smiArr = scalp_calcSMI(prices, 8, 3, 3, 10);
+    const smiNow = smiArr[n - 1];
+    const smiK = smiNow.smi;
+    const smiD = smiNow.signal;
+
+    // SMI thresholds (configurable)
+    const smiOversold   = cfg.scalp_smiOversold  !== undefined ? cfg.scalp_smiOversold  : -40;
+    const smiOverbought = cfg.scalp_smiOverbought !== undefined ? cfg.scalp_smiOverbought :  40;
+
+    // SMI crossover detection
+    const smiCrossUp   = scalpPrevSmiK !== null && smiK > smiD   && scalpPrevSmiK <= scalpPrevSmiD;
+    const smiCrossDown = scalpPrevSmiK !== null && smiK < smiD   && scalpPrevSmiK >= scalpPrevSmiD;
+
+    // RSI thresholds (configurable, adjusted from 30/70 for tick speed)
+    const rsiCallMin = cfg.scalp_rsiCallMin !== undefined ? cfg.scalp_rsiCallMin : 40;
+    const rsiPutMax  = cfg.scalp_rsiPutMax  !== undefined ? cfg.scalp_rsiPutMax  : 60;
+
+    let fired = false;
+
+    if (scalpWeather === 'BULLISH') {
+      const atFence    = price <= bb.lower;
+      const rsiMacdOk  = rsi > rsiCallMin || macdHistRising;
+      if (atFence && rsiMacdOk && smiCrossUp && smiK < smiOverbought) {
+        triggerSignal('BUY', 90, '3SCALP:BULL-BB-SMI', null, null, null);
+        scalpIsTradeActive = true;
+        fired = true;
+      }
+    }
+
+    if (!fired && scalpWeather === 'BEARISH') {
+      const atFence    = price >= bb.upper;
+      const rsiMacdOk  = rsi < rsiPutMax || macdHistFalling;
+      if (atFence && rsiMacdOk && smiCrossDown && smiK > smiOversold) {
+        triggerSignal('SELL', 90, '3SCALP:BEAR-BB-SMI', null, null, null);
+        scalpIsTradeActive = true;
+        fired = true;
+      }
+    }
+
+    // Update live SMI display
+    const smiEl = document.getElementById('tt-scalp-smi');
+    if (smiEl) smiEl.textContent = `K:${smiK.toFixed(1)} D:${smiD.toFixed(1)}`;
+    const rsiEl = document.getElementById('tt-scalp-rsi');
+    if (rsiEl) rsiEl.textContent = `RSI:${rsi.toFixed(1)} BB-L:${bb.lower.toFixed(2)} BB-U:${bb.upper.toFixed(2)}`;
+
+    // Save for next tick
+    scalpPrevSmiK = smiK;
+    scalpPrevSmiD = smiD;
+    scalpPrevMacdHist = macdNow.hist;
+  }
+
   let patternLibrary = {};
   let rollingDirections = "";
   let lastPriceForDir = null;
@@ -164,6 +348,18 @@
   let lastMetrics = null;
   let discoveryAuditLog = []; // Black Box: every-tick state recorder
   let lastProcessedSeq = ""; // Streak lock: prevents re-arming on unchanged sequence
+
+  // ── 3-Scalp Strategy State ───────────────────────────────────────────────
+  let scalpWeather = "FLAT";          // "BULLISH" | "BEARISH" | "FLAT"
+  let scalpIsTradeActive = false;     // Duplication lock
+  let scalp1mCandles = [];            // Rolling 1-min OHLC candles
+  let scalp1mCurrentCandle = null;    // In-progress candle being built from ticks
+  let scalp1mWsCandle = null;         // Separate WS for 1-min candle feed
+  let scalpTickPrices = [];           // Rolling tick price buffer for scalp indicators
+  const SCALP_TICK_BUF = 300;
+  let scalpPrevSmiK = null;           // Previous SMI K for crossover detection
+  let scalpPrevSmiD = null;           // Previous SMI D for crossover detection
+  let scalpPrevMacdHist = null;       // Previous MACD histogram for rising/falling check
   let signals = [], sessionTradesAll = [];
   let tickSeq = 0, lastSignalTickIndex = -999, upStreak = 0, downStreak = 0;
   let lastTickProcessedAt = 0, lastSignalEvalAt = 0, watchdogInterval = null, evalErrorCount = 0;
@@ -193,6 +389,15 @@
         <div class="tt-row"><span class="tt-label">RSI / Trend</span><span class="tt-val" id="tt-rsi-stats">0 / 0.00</span></div>
         <div class="tt-row"><span class="tt-label">Int/Eps/Accel</span><span class="tt-val" id="tt-unleashed-stats">0 / 0 / 0.00000</span></div>
         <div class="tt-row" id="tt-regime-row" style="justify-content:center; font-weight:bold; color:#7ec8e3;"><span id="tt-regime-display">D · NOISE · BBW: 0.00</span></div>
+        <div class="tt-row" id="tt-scalp-row" style="display:none; flex-direction:column; gap:2px; padding:3px 0;">
+          <div style="display:flex; gap:6px; align-items:center; font-size:10px;">
+            <span style="color:#7a8499;">WEATHER</span>
+            <span id="tt-scalp-weather" style="font-weight:bold; color:#f0c040;">FLAT</span>
+            <span style="color:#7a8499; margin-left:6px;">SMI</span>
+            <span id="tt-scalp-smi" style="color:#7ec8e3; font-family:monospace;">K:- D:-</span>
+          </div>
+          <div style="font-size:9px; color:#7a8499; font-family:monospace;" id="tt-scalp-rsi">RSI:- BB-L:- BB-U:-</div>
+        </div>
         <div class="tt-row"><span class="tt-label">Session W/L</span><span class="tt-val"><span id="tt-wins">0</span> / <span id="tt-losses">0</span></span></div>
         <div id="tt-signals-list"></div>
         <div id="tt-discovery-diag" style="display:none; padding:6px; background:rgba(0,0,0,0.2); border-radius:4px; margin-top:4px; max-height:400px; overflow:hidden; flex-direction:column; gap:4px;">
@@ -248,12 +453,43 @@
           <button id="tt-clear-logs" style="flex:1;background:#3d1a1a;color:#e04040;font-size:10px;border:1px solid #7a3a10;border-radius:4px;cursor:pointer;">Clear Logs</button>
         </div>
         <div id="tt-config">
-          <div class="tt-config-row"><label>Mode</label><select id="tt-cfg-strategy-mode"><option value="discoveryEvolution">🧬 Discovery Evolution</option></select></div>
+          <div class="tt-config-row"><label>Mode</label><select id="tt-cfg-strategy-mode"><option value="discoveryEvolution">🧬 Discovery Evolution</option><option value="threeSecScalp">⚡ 3-Sec Scalp</option></select></div>
           <div id="tt-cfg-seq-master-container" style="display:none; flex-direction:column; gap:4px; margin-top:4px;">
             <label style="font-size:10px; color:#7a8499;">DNA JSON Config</label>
             <textarea id="tt-cfg-seq-master-json" placeholder='Paste JSON DNA here...' style="width:100%; height:120px; background:#1e2338; border:1px solid #3a4260; color:#e0e6f0; border-radius:4px; font-size:10px; font-family:monospace; resize:vertical;"></textarea>
           </div>
           <div class="tt-config-row"><label>Debug Signals</label><input type="checkbox" id="tt-cfg-debug"></div>
+          <div id="tt-scalp-settings" style="display:none; flex-direction:column; gap:4px; margin-top:4px;">
+            <div class="tt-config-section-label">⚡ 3-Sec Scalp Settings</div>
+            <div class="tt-config-row" style="gap:4px;">
+              <label style="flex:1.5;">RSI Period</label>
+              <input type="number" id="tt-scalp-rsi-period" min="3" max="21" style="width:48px;background:#1e2338;border:1px solid #3a4260;color:#e0e6f0;border-radius:3px;padding:2px;font-size:10px;" placeholder="7">
+            </div>
+            <div class="tt-config-row" style="gap:4px;">
+              <label style="flex:1.5;">RSI Min (CALL)</label>
+              <input type="number" id="tt-scalp-rsi-call-min" min="20" max="60" style="width:48px;background:#1e2338;border:1px solid #3a4260;color:#e0e6f0;border-radius:3px;padding:2px;font-size:10px;" placeholder="40">
+            </div>
+            <div class="tt-config-row" style="gap:4px;">
+              <label style="flex:1.5;">RSI Max (PUT)</label>
+              <input type="number" id="tt-scalp-rsi-put-max" min="40" max="80" style="width:48px;background:#1e2338;border:1px solid #3a4260;color:#e0e6f0;border-radius:3px;padding:2px;font-size:10px;" placeholder="60">
+            </div>
+            <div class="tt-config-row" style="gap:4px;">
+              <label style="flex:1.5;">SMI Oversold (≤)</label>
+              <input type="number" id="tt-scalp-smi-oversold" min="-100" max="0" style="width:52px;background:#1e2338;border:1px solid #3a4260;color:#e0e6f0;border-radius:3px;padding:2px;font-size:10px;" placeholder="-40">
+            </div>
+            <div class="tt-config-row" style="gap:4px;">
+              <label style="flex:1.5;">SMI Overbought (≥)</label>
+              <input type="number" id="tt-scalp-smi-overbought" min="0" max="100" style="width:52px;background:#1e2338;border:1px solid #3a4260;color:#e0e6f0;border-radius:3px;padding:2px;font-size:10px;" placeholder="40">
+            </div>
+            <div class="tt-config-row" style="gap:4px;">
+              <label style="flex:1.5;">BB Period (tick)</label>
+              <input type="number" id="tt-scalp-bb-period" min="5" max="30" style="width:48px;background:#1e2338;border:1px solid #3a4260;color:#e0e6f0;border-radius:3px;padding:2px;font-size:10px;" placeholder="12">
+            </div>
+            <div class="tt-config-row" style="gap:4px;">
+              <label style="flex:1.5;">Min BB Spread</label>
+              <input type="number" id="tt-scalp-min-bb-spread" min="0" max="5" step="0.01" style="width:52px;background:#1e2338;border:1px solid #3a4260;color:#e0e6f0;border-radius:3px;padding:2px;font-size:10px;" placeholder="0.05">
+            </div>
+          </div>
           <div class="tt-config-section-label">Real Trade Master</div>
           <div class="tt-config-row"><label style="color:#f0a060;font-weight:700;">Enable Real Execution</label><label class="tt-switch"><input type="checkbox" id="tt-cfg-real-enabled"><span class="tt-slider"></span></label></div>
         </div>
@@ -340,8 +576,51 @@
     ws.addEventListener('message', (e) => {
       var msg; try { msg = JSON.parse(e.data); } catch (_) { return; }
       if (msg.error) return;
-      if (msg.msg_type === 'active_symbols') { var sym = resolveSymbol(msg.active_symbols || []); if (sym) { resolvedSymbol = sym; ws.send(JSON.stringify({ ticks: resolvedSymbol, subscribe: 1 })); } return; }
+      if (msg.msg_type === 'active_symbols') {
+        var sym = resolveSymbol(msg.active_symbols || []);
+        if (sym) {
+          resolvedSymbol = sym;
+          ws.send(JSON.stringify({ ticks: resolvedSymbol, subscribe: 1 }));
+          // Subscribe to 1-min candles for the 3-Scalp weather module
+          const nowEpoch = Math.floor(Date.now() / 1000);
+          ws.send(JSON.stringify({
+            ticks_history: resolvedSymbol,
+            style: 'candles',
+            granularity: 60,
+            count: 30,           // Seed with 30 historical 1-min candles for immediate warm-up
+            end: 'latest',
+            subscribe: 1
+          }));
+        }
+        return;
+      }
       if (msg.msg_type === 'tick') handleTick(msg.tick);
+      // 1-min candle feed for 3-Scalp weather module
+      if (msg.msg_type === 'candles' || msg.msg_type === 'ohlc') {
+        if (msg.msg_type === 'candles' && msg.candles) {
+          // Seed with historical candles
+          scalp1mCandles = msg.candles.map(c => ({
+            open: parseFloat(c.open), high: parseFloat(c.high),
+            low: parseFloat(c.low),  close: parseFloat(c.close),
+            epoch: c.epoch
+          }));
+          scalp_updateWeather();
+        } else if (msg.msg_type === 'ohlc' && msg.ohlc) {
+          // Live streaming candle update
+          const o = msg.ohlc;
+          const candle = { open: parseFloat(o.open), high: parseFloat(o.high), low: parseFloat(o.low), close: parseFloat(o.close), epoch: o.open_time || o.epoch };
+          const last = scalp1mCandles.length ? scalp1mCandles[scalp1mCandles.length - 1] : null;
+          if (last && last.epoch === candle.epoch) {
+            // Same candle — update in-place (price still moving within this minute)
+            scalp1mCandles[scalp1mCandles.length - 1] = candle;
+          } else {
+            // New candle = previous one closed — update weather on close
+            scalp1mCandles.push(candle);
+            if (scalp1mCandles.length > 100) scalp1mCandles.shift();
+            scalp_updateWeather();
+          }
+        }
+      }
     });
     ws.addEventListener('close', () => { setWsState('disconnected'); resolvedSymbol = null; if (!manualClose) scheduleReconnect(); });
     ws.addEventListener('error', () => { setWsState('disconnected'); ws.close(); });
@@ -438,6 +717,9 @@
     } else {
       if (regimeRow) regimeRow.style.display = 'none';
     }
+    // 3-Scalp row visibility
+    const scalpRow = document.getElementById('tt-scalp-row');
+    if (scalpRow) scalpRow.style.display = cfg.strategyMode === 'threeSecScalp' ? 'flex' : 'none';
   }
 
   function handleTick(tick) {
@@ -622,6 +904,14 @@
       if (discoveryAuditLog.length > 20000) discoveryAuditLog.shift();
 
       lastPriceForDir = price;
+    }
+
+    // 3-Scalp: feed tick prices + release trade lock on each tick
+    scalpTickPrices.push(price);
+    if (scalpTickPrices.length > SCALP_TICK_BUF) scalpTickPrices.shift();
+    if (scalpIsTradeActive && realExecState === 'IDLE') scalpIsTradeActive = false;
+    if (cfg.strategyMode === 'threeSecScalp') {
+      try { scalp_onTick(price); } catch(e) { console.error('[3SCALP]', e); }
     }
 
     try { detectSignal(); lastSignalEvalAt = Date.now(); } catch (e) { evalErrorCount++; }
@@ -822,10 +1112,18 @@
   }
   function safeStorage(op, key, val) { try { if (op === 'get') return JSON.parse(localStorage.getItem(key)); if (op === 'set') localStorage.setItem(key, JSON.stringify(val)); } catch (_) { } return null; }
   function saveCfg() { safeStorage('set', 'tt-cfg', cfg); }
-  function loadCfg() { const stored = safeStorage('get', 'tt-cfg'); return Object.assign({ strategyMode: 'discoveryEvolution', epsilon: 0.1, realTradeEnabled: false, realTimeoutMs: 40000, realCooldownMs: 5000, postTradeCooldownTicks: 5, postTradeCooldownMs: 5000, debugSignals: true, adxMin: undefined, adxMax: undefined, adxPeriod: 14, rsiPeriod: 14, trendEmaPeriod: 10, minBBWidth: undefined, maxBBWidth: undefined, seqMasterConfig: '' }, stored || {}); }
+  function loadCfg() { const stored = safeStorage('get', 'tt-cfg'); return Object.assign({ strategyMode: 'discoveryEvolution', epsilon: 0.1, realTradeEnabled: false, realTimeoutMs: 40000, realCooldownMs: 5000, postTradeCooldownTicks: 5, postTradeCooldownMs: 5000, debugSignals: true, adxMin: undefined, adxMax: undefined, adxPeriod: 14, rsiPeriod: 14, trendEmaPeriod: 10, minBBWidth: undefined, maxBBWidth: undefined, seqMasterConfig: '', scalp_rsiPeriod: 7, scalp_rsiCallMin: 40, scalp_rsiPutMax: 60, scalp_smiOversold: -40, scalp_smiOverbought: 40, scalp_bbPeriod: 12, scalp_minBbSpread: 0.05 }, stored || {}); }
   function updateSeqMasterUIVisibility() {
     const container = document.getElementById('tt-cfg-seq-master-container');
     if (container) container.style.display = 'none';
+    // 3-Scalp: show settings panel and status row only when that mode is active
+    const scalpSettings = document.getElementById('tt-scalp-settings');
+    const scalpRow      = document.getElementById('tt-scalp-row');
+    const regimeRow     = document.getElementById('tt-regime-row');
+    const isScalp = cfg.strategyMode === 'threeSecScalp';
+    if (scalpSettings) scalpSettings.style.display = isScalp ? 'flex' : 'none';
+    if (scalpRow)      scalpRow.style.display      = isScalp ? 'flex' : 'none';
+    if (regimeRow)     regimeRow.style.display      = (cfg.strategyMode === 'discoveryEvolution') ? 'flex' : 'none';
   }
 
   function validateSeqMasterJSON(raw) {
@@ -1108,6 +1406,27 @@
       seqJson.value = cfg.seqMasterConfig || '';
       validateSeqMasterJSON(seqJson.value);
     }
+
+    // Wire 3-Scalp settings inputs
+    const scalpFields = {
+      'tt-scalp-rsi-period':    ['scalp_rsiPeriod',    v => parseInt(v)],
+      'tt-scalp-rsi-call-min':  ['scalp_rsiCallMin',   v => parseFloat(v)],
+      'tt-scalp-rsi-put-max':   ['scalp_rsiPutMax',    v => parseFloat(v)],
+      'tt-scalp-smi-oversold':  ['scalp_smiOversold',  v => parseFloat(v)],
+      'tt-scalp-smi-overbought':['scalp_smiOverbought',v => parseFloat(v)],
+      'tt-scalp-bb-period':     ['scalp_bbPeriod',     v => parseInt(v)],
+      'tt-scalp-min-bb-spread': ['scalp_minBbSpread',  v => parseFloat(v)]
+    };
+    Object.entries(scalpFields).forEach(([id, [key, parse]]) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.value = cfg[key] !== undefined ? cfg[key] : el.placeholder;
+      el.addEventListener('input', function() {
+        const v = parse(this.value);
+        if (!isNaN(v)) { cfg[key] = v; saveCfg(); }
+      });
+    });
+
     updateSeqMasterUIVisibility();
     updateRealUI();
   }
