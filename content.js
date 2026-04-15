@@ -28,6 +28,11 @@
     tickSize: 0.1,
     strategyMode: 'discoveryEvolution',
     seqMasterConfig: '',
+    smiOb: 40,
+    smiOs: -40,
+    rsiMaxPut: 55,
+    rsiMinCall: 45,
+    minSqueeze: 0.2,
     epsilon: 0.1,
     realTradeEnabled: false,
     realTimeoutMs: 40000,
@@ -48,6 +53,8 @@
   let ticks = [];
   let tickDirections = [];
   let speedHistory = [];
+  let candles1m = [];
+  let currentWeather = 'FLAT';
   let parsedSeqMasterConfig = null;
   let parsedDnaConfig = null;
   let dnaWorker = null;
@@ -145,8 +152,16 @@
           <button id="tt-config-toggle" style="flex:1;">Settings</button>
           <button id="tt-clear-logs" style="flex:1;background:#3d1a1a;color:#e04040;font-size:10px;border:1px solid #7a3a10;border-radius:4px;cursor:pointer;">Clear Logs</button>
         </div>
+        <div class="tt-row"><span class="tt-label">1-Min Weather</span><span class="tt-val" id="tt-weather-stats" style="font-weight:bold;">FLAT</span></div>
         <div id="tt-config">
-          <div class="tt-config-row"><label>Mode</label><select id="tt-cfg-strategy-mode"><option value="discoveryEvolution">🧬 Discovery Evolution</option></select></div>
+          <div class="tt-config-row"><label>Mode</label><select id="tt-cfg-strategy-mode"><option value="discoveryEvolution">🧬 Discovery Evolution</option><option value="threeSecondScalp">⏱️ 3-Second Scalp</option></select></div>
+          <div id="tt-cfg-three-sec-container" style="display:none; flex-direction:column; gap:4px; margin-top:4px; font-size:10px;">
+            <div class="tt-config-row"><label>SMI Overbought</label><input type="number" id="tt-cfg-smi-ob" value="40" style="width:40px; background:#1e2338; color:#e0e6f0; border:1px solid #3a4260;"></div>
+            <div class="tt-config-row"><label>SMI Oversold</label><input type="number" id="tt-cfg-smi-os" value="-40" style="width:40px; background:#1e2338; color:#e0e6f0; border:1px solid #3a4260;"></div>
+            <div class="tt-config-row"><label>Tick RSI Max (Put)</label><input type="number" id="tt-cfg-rsi-max" value="55" style="width:40px; background:#1e2338; color:#e0e6f0; border:1px solid #3a4260;"></div>
+            <div class="tt-config-row"><label>Tick RSI Min (Call)</label><input type="number" id="tt-cfg-rsi-min" value="45" style="width:40px; background:#1e2338; color:#e0e6f0; border:1px solid #3a4260;"></div>
+            <div class="tt-config-row"><label>Min BB Squeeze</label><input type="number" step="0.1" id="tt-cfg-min-squeeze" value="0.2" style="width:40px; background:#1e2338; color:#e0e6f0; border:1px solid #3a4260;"></div>
+          </div>
           <div id="tt-cfg-seq-master-container" style="display:none; flex-direction:column; gap:4px; margin-top:4px;">
             <label style="font-size:10px; color:#7a8499;">DNA JSON Config</label>
             <textarea id="tt-cfg-seq-master-json" placeholder='Paste JSON DNA here...' style="width:100%; height:120px; background:#1e2338; border:1px solid #3a4260; color:#e0e6f0; border-radius:4px; font-size:10px; font-family:monospace; resize:vertical;"></textarea>
@@ -207,6 +222,20 @@
       validateSeqMasterJSON(this.value);
       saveCfg();
     });
+    ['smi-ob', 'smi-os', 'rsi-max', 'rsi-min', 'min-squeeze'].forEach(id => {
+      const el = document.getElementById(`tt-cfg-${id}`);
+      if (el) {
+        el.addEventListener('change', function() {
+          if (id === 'smi-ob') cfg.smiOb = parseFloat(this.value);
+          if (id === 'smi-os') cfg.smiOs = parseFloat(this.value);
+          if (id === 'rsi-max') cfg.rsiMaxPut = parseFloat(this.value);
+          if (id === 'rsi-min') cfg.rsiMinCall = parseFloat(this.value);
+          if (id === 'min-squeeze') cfg.minSqueeze = parseFloat(this.value);
+          saveCfg();
+        });
+      }
+    });
+
     document.getElementById('tt-cfg-debug').addEventListener('change', function () { cfg.debugSignals = this.checked; saveCfg(); });
     document.getElementById('tt-cfg-real-enabled').addEventListener('change', function () { cfg.realTradeEnabled = this.checked; saveCfg(); });
     document.getElementById('tt-real-export').addEventListener('click', exportRealCSV);
@@ -238,8 +267,10 @@
     ws.addEventListener('message', (e) => {
       var msg; try { msg = JSON.parse(e.data); } catch (_) { return; }
       if (msg.error) return;
-      if (msg.msg_type === 'active_symbols') { var sym = resolveSymbol(msg.active_symbols || []); if (sym) { resolvedSymbol = sym; ws.send(JSON.stringify({ ticks: resolvedSymbol, subscribe: 1 })); } return; }
+      if (msg.msg_type === 'active_symbols') { var sym = resolveSymbol(msg.active_symbols || []); if (sym) { resolvedSymbol = sym; ws.send(JSON.stringify({ ticks: resolvedSymbol, subscribe: 1 })); ws.send(JSON.stringify({ ticks_history: resolvedSymbol, end: "latest", count: 20, style: "candles", granularity: 60, subscribe: 1 })); } return; }
       if (msg.msg_type === 'tick') handleTick(msg.tick);
+      if (msg.msg_type === 'candles') handleCandles(msg.candles);
+      if (msg.msg_type === 'ohlc') handleOHLC(msg.ohlc);
     });
     ws.addEventListener('close', () => { setWsState('disconnected'); resolvedSymbol = null; if (!manualClose) scheduleReconnect(); });
     ws.addEventListener('error', () => { setWsState('disconnected'); ws.close(); });
@@ -250,6 +281,71 @@
     if (failCount >= FALLBACK_AFTER) { usingFallback = !usingFallback; failCount = 0; }
     reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, reconnectDelay);
     reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX);
+  }
+
+  function updateWeatherModule() {
+    if (candles1m.length < 11) return;
+
+    // Calculate 1-Min ROC (2)
+    const currentClose = candles1m[candles1m.length - 1].close;
+    const prev2Close = candles1m[candles1m.length - 3].close; // T-2
+    const roc = currentClose - prev2Close;
+
+    // Calculate 1-Min BB Middle EMA (10)
+    let emaSum = candles1m[0].close;
+    const kEma = 2 / (10 + 1);
+    const emaPeriod = 10;
+
+    let bbMiddleEma = candles1m[candles1m.length - emaPeriod].close;
+    for (let i = candles1m.length - emaPeriod + 1; i < candles1m.length; i++) {
+        bbMiddleEma = (candles1m[i].close * kEma) + (bbMiddleEma * (1 - kEma));
+    }
+
+    if (roc > 0 && currentClose > bbMiddleEma) {
+      currentWeather = "BULLISH";
+    } else if (roc < 0 && currentClose < bbMiddleEma) {
+      currentWeather = "BEARISH";
+    } else {
+      currentWeather = "FLAT";
+    }
+
+    const weatherEl = document.getElementById('tt-weather-stats');
+    if (weatherEl) {
+      weatherEl.textContent = currentWeather;
+      weatherEl.style.color = currentWeather === 'BULLISH' ? '#3ecf60' : (currentWeather === 'BEARISH' ? '#e04040' : '#fff');
+    }
+  }
+
+  function handleCandles(candles) {
+    if (!candles || !candles.length) return;
+    candles1m = candles.map(c => ({
+      epoch: c.epoch,
+      open: parseFloat(c.open),
+      high: parseFloat(c.high),
+      low: parseFloat(c.low),
+      close: parseFloat(c.close)
+    }));
+    updateWeatherModule();
+  }
+
+  function handleOHLC(ohlc) {
+    if (!ohlc) return;
+    const epoch = ohlc.open_time;
+    const candle = {
+      epoch: epoch,
+      open: parseFloat(ohlc.open),
+      high: parseFloat(ohlc.high),
+      low: parseFloat(ohlc.low),
+      close: parseFloat(ohlc.close)
+    };
+
+    if (candles1m.length > 0 && candles1m[candles1m.length - 1].epoch === epoch) {
+      candles1m[candles1m.length - 1] = candle;
+    } else {
+      candles1m.push(candle);
+      if (candles1m.length > 50) candles1m.shift();
+      updateWeatherModule(); // Only update weather on bar close (or new bar open)
+    }
   }
 
   function setWsState(state) {
@@ -355,6 +451,81 @@
     const kTrend = 2 / ((cfg.trendEmaPeriod || 15) + 1);
     const trendEma = prevTick ? (price * kTrend + (prevTick.trendEma || price) * (1 - kTrend)) : price;
 
+    // Tick BB (12, 2, EMA)
+    let tickBbUpper = price, tickBbLower = price, tickBbWidth = 0;
+    const bbPeriod = 12;
+    if (ticks.length >= bbPeriod) {
+      let slice = ticks.slice(-(bbPeriod - 1));
+      slice.push({ price }); // Include current price
+      let emaSum = slice[0].price;
+      const kBb = 2 / (bbPeriod + 1);
+      let bbMiddleEma = slice[0].price;
+      for (let i = 1; i < slice.length; i++) {
+        bbMiddleEma = (slice[i].price * kBb) + (bbMiddleEma * (1 - kBb));
+      }
+
+      const sqDiffSum = slice.reduce((a, b) => a + Math.pow(b.price - bbMiddleEma, 2), 0);
+      const stdDev = Math.sqrt(sqDiffSum / bbPeriod);
+      tickBbUpper = bbMiddleEma + (2 * stdDev);
+      tickBbLower = bbMiddleEma - (2 * stdDev);
+      tickBbWidth = tickBbUpper - tickBbLower;
+    }
+
+    // Tick MACD (12, 26, 9)
+    let macd = 0, macdSignal = 0, macdHist = 0, macdHistRising = false, macdHistFalling = false;
+    if (ticks.length >= 26) {
+      let slice = ticks.slice(-26);
+      slice.push({ price });
+      const kFast = 2 / (12 + 1), kSlow = 2 / (26 + 1), kSig = 2 / (9 + 1);
+
+      let emaFast = slice[0].price, emaSlow = slice[0].price;
+      const macdArr = [];
+      for(let i = 1; i < slice.length; i++) {
+        emaFast = (slice[i].price * kFast) + (emaFast * (1 - kFast));
+        emaSlow = (slice[i].price * kSlow) + (emaSlow * (1 - kSlow));
+        macdArr.push(emaFast - emaSlow);
+      }
+      macd = macdArr[macdArr.length - 1];
+
+      let sigEma = macdArr[0];
+      for(let i = 1; i < macdArr.length; i++) {
+        sigEma = (macdArr[i] * kSig) + (sigEma * (1 - kSig));
+      }
+      macdSignal = sigEma;
+      macdHist = macd - macdSignal;
+
+      if (prevTick && prevTick.macdHist !== undefined) {
+        macdHistRising = macdHist > prevTick.macdHist;
+        macdHistFalling = macdHist < prevTick.macdHist;
+      }
+    }
+
+    // Tick SMI (8, 3, 3, 10)
+    let smiLine = 0, smiSignal = 0, d1, hl1, d2, hl2;
+    if (ticks.length >= 20) {
+      // 1. Raw Momentum
+      const len8 = 8, ema1 = 3, ema2 = 3, signalPeriod = 10;
+      let slice = ticks.slice(-len8);
+      slice.push({ price });
+      let hMax = Math.max(...slice.map(s => s.price));
+      let lMin = Math.min(...slice.map(s => s.price));
+      let midPoint = (hMax + lMin) / 2;
+      let d = price - midPoint;
+      let hl = hMax - lMin;
+
+      // Realistically we need history of 'd' and 'hl' to calculate EMA1 and EMA2 properly
+      // To keep it performant, we'll store them in tick objects and smooth progressively
+      d1 = prevTick && prevTick.smiD1 ? (d * (2/(ema1+1))) + (prevTick.smiD1 * (1 - (2/(ema1+1)))) : d;
+      hl1 = prevTick && prevTick.smiHl1 ? (hl * (2/(ema1+1))) + (prevTick.smiHl1 * (1 - (2/(ema1+1)))) : hl;
+
+      d2 = prevTick && prevTick.smiD2 ? (d1 * (2/(ema2+1))) + (prevTick.smiD2 * (1 - (2/(ema2+1)))) : d1;
+      hl2 = prevTick && prevTick.smiHl2 ? (hl1 * (2/(ema2+1))) + (prevTick.smiHl2 * (1 - (2/(ema2+1)))) : hl1;
+
+      smiLine = hl2 === 0 ? 0 : 100 * (d2 / (hl2 / 2));
+
+      smiSignal = prevTick && prevTick.smiSignal ? (smiLine * (2/(signalPeriod+1))) + (prevTick.smiSignal * (1 - (2/(signalPeriod+1)))) : smiLine;
+    }
+
     let adx = 0;
     const adxP = cfg.adxPeriod || 14;
     if (ticks.length >= adxP) {
@@ -410,7 +581,14 @@
     tickDirections.push(dirChar);
     if (tickDirections.length > 20) tickDirections.shift();
 
-    const state = { epoch, price, direction, deltaSteps, deltaTime, speed, absSpeed, speedTrend, upStreak, downStreak, lastDigit, deltaChange: deltaChangeVal, receivedAt: now, accel, intensity, preSpeed, acceleration, trendEma, ema10: trendEma, adx, rsi, speed5, accel5 };
+    const state = {
+        epoch, price, direction, deltaSteps, deltaTime, speed, absSpeed, speedTrend, upStreak, downStreak, lastDigit,
+        deltaChange: deltaChangeVal, receivedAt: now, accel, intensity, preSpeed, acceleration, trendEma, ema10: trendEma,
+        adx, rsi, speed5, accel5,
+        tickBbUpper, tickBbLower, tickBbWidth,
+        macdHist, macdHistRising, macdHistFalling,
+        smiLine, smiSignal, smiD1: typeof d1 !== 'undefined' ? d1 : 0, smiHl1: typeof hl1 !== 'undefined' ? hl1 : 0, smiD2: typeof d2 !== 'undefined' ? d2 : 0, smiHl2: typeof hl2 !== 'undefined' ? hl2 : 0
+    };
     ticks.push(state); if (ticks.length > TICK_BUF) ticks.shift();
     speedHistory.push(absSpeed); if (speedHistory.length > SPEED_BUF) speedHistory.shift();
     calculatePercentiles(); lastTickProcessedAt = Date.now();
@@ -570,6 +748,39 @@
 
     let res = null;
 
+    if (mode === 'threeSecondScalp') {
+      const isTradeActive = realExecState === 'OPEN' || realExecState === 'OPEN_PENDING' || realExecState === 'RECOVERY';
+      if (isTradeActive) return null; // Module 2 Lock
+
+      if (currentWeather === 'BULLISH') {
+        const isAtLowerFence = t0.price <= t0.tickBbLower;
+        const isRsiMacdValid = t0.rsi > cfg.rsiMinCall || t0.macdHistRising;
+        const isSqueezeValid = t0.tickBbWidth > cfg.minSqueeze;
+
+        if (isAtLowerFence && isRsiMacdValid && isSqueezeValid) {
+          const stochCrossUp = t0.smiLine > t0.smiSignal && tMinus1.smiLine <= tMinus1.smiSignal;
+          const stochInOversold = t0.smiLine < cfg.smiOs && t0.smiSignal < cfg.smiOs;
+
+          if (stochCrossUp && stochInOversold) {
+            res = { type: 'BUY', conf: 100, triggerDesc: `3SEC: SMI Cross UP (Line:${t0.smiLine.toFixed(1)} < ${cfg.smiOs})`, triggerDigit: t0.lastDigit, startTickIndex: tickSeq + 1 };
+          }
+        }
+      } else if (currentWeather === 'BEARISH') {
+        const isAtUpperFence = t0.price >= t0.tickBbUpper;
+        const isRsiMacdValid = t0.rsi < cfg.rsiMaxPut || t0.macdHistFalling;
+        const isSqueezeValid = t0.tickBbWidth > cfg.minSqueeze;
+
+        if (isAtUpperFence && isRsiMacdValid && isSqueezeValid) {
+          const stochCrossDown = t0.smiLine < t0.smiSignal && tMinus1.smiLine >= tMinus1.smiSignal;
+          const stochInOverbought = t0.smiLine > cfg.smiOb && t0.smiSignal > cfg.smiOb;
+
+          if (stochCrossDown && stochInOverbought) {
+            res = { type: 'SELL', conf: 100, triggerDesc: `3SEC: SMI Cross DOWN (Line:${t0.smiLine.toFixed(1)} > ${cfg.smiOb})`, triggerDigit: t0.lastDigit, startTickIndex: tickSeq + 1 };
+          }
+        }
+      }
+    }
+
     // discoveryEvolution is handled directly in handleTick via the rolling direction engine
     // No additional signal detection needed here for this mode
 
@@ -722,7 +933,9 @@
   function loadCfg() { const stored = safeStorage('get', 'tt-cfg'); return Object.assign({ strategyMode: 'discoveryEvolution', epsilon: 0.1, realTradeEnabled: false, realTimeoutMs: 40000, realCooldownMs: 5000, postTradeCooldownTicks: 5, postTradeCooldownMs: 5000, debugSignals: true, adxMin: undefined, adxMax: undefined, adxPeriod: 14, rsiPeriod: 14, trendEmaPeriod: 10, minBBWidth: undefined, maxBBWidth: undefined, seqMasterConfig: '' }, stored || {}); }
   function updateSeqMasterUIVisibility() {
     const container = document.getElementById('tt-cfg-seq-master-container');
-    if (container) container.style.display = 'none';
+    const threeSec = document.getElementById('tt-cfg-three-sec-container');
+    if (container) container.style.display = cfg.strategyMode === 'discoveryEvolution' ? 'flex' : 'none';
+    if (threeSec) threeSec.style.display = cfg.strategyMode === 'threeSecondScalp' ? 'flex' : 'none';
   }
 
   function validateSeqMasterJSON(raw) {
@@ -1021,6 +1234,13 @@
       seqJson.value = cfg.seqMasterConfig || '';
       validateSeqMasterJSON(seqJson.value);
     }
+
+    if (document.getElementById('tt-cfg-smi-ob')) document.getElementById('tt-cfg-smi-ob').value = cfg.smiOb || 40;
+    if (document.getElementById('tt-cfg-smi-os')) document.getElementById('tt-cfg-smi-os').value = cfg.smiOs || -40;
+    if (document.getElementById('tt-cfg-rsi-max')) document.getElementById('tt-cfg-rsi-max').value = cfg.rsiMaxPut || 55;
+    if (document.getElementById('tt-cfg-rsi-min')) document.getElementById('tt-cfg-rsi-min').value = cfg.rsiMinCall || 45;
+    if (document.getElementById('tt-cfg-min-squeeze')) document.getElementById('tt-cfg-min-squeeze').value = cfg.minSqueeze || 0.2;
+
     updateSeqMasterUIVisibility();
     updateRealUI();
   }
