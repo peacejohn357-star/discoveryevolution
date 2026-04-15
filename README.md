@@ -1,6 +1,6 @@
 # 3Tick Scalper – Step Index 100 Assistant
 
-A Chrome extension that overlays a real-time trading assistant on [dtrader.deriv.com](https://dtrader.deriv.com) for **Step Index 100** manual and automated scalping using 3-tick micro-timing logic.
+A Chrome extension that overlays a real-time trading assistant on [dtrader.deriv.com](https://dtrader.deriv.com) for **Step Index 100** manual and automated scalping.
 
 ---
 
@@ -8,42 +8,38 @@ A Chrome extension that overlays a real-time trading assistant on [dtrader.deriv
 
 | Feature | Details |
 |---|---|
-| **Micro-Timing Engine** | Streams Step Index 100 ticks via the public Deriv WebSocket and calculates real-time microstructure features (normalized speed, speed trend, streaks, delta change, and last digits). |
-| **Adaptive Speed Bands** | Uses a 100-tick rolling buffer to calculate dynamic $S_{high}$ and $S_{low}$ thresholds using a hybrid of 70th/30th percentiles and Standard Deviation ($mean \pm std$). |
-| **4 Advanced Strategies** | Includes **Structural** (base layer), **Hybrid** (optimal balance), **Momentum** (early entry), and **Reversal** (exhaustion) logic. |
-| **Peak Speed Prevention** | Momentum strategy detects acceleration and enters *before* price reaches peak speed ($S_{high}$) to maximize 3-tick window efficiency. |
-| **No-Trade Filters** | Global filters block entries during transition streak zones (3-4), neutral momentum (within 0.2 step epsilon), or flat mid-range trends. |
-| **Real Execution** | Master toggle to enable automated clicking of "Rise"/"Fall" and "Purchase" buttons with robust state management and outcome tracking via DOM observation. |
-| **Draggable Overlay** | Floating statistics panel showing real-time price, speed distribution, strategy confidence, and session W/L performance. |
-| **CSV Export** | Export signal history and real-trade execution logs for performance analysis. |
+| **Strategy Modes** | Features two main operational modes: **🧬 Discovery Evolution** (pattern matching DNA) and **⚡ 3-Sec Scalp** (momentum indicators). |
+| **Discovery Evolution** | Analyzes rolling tick sequences, tracks metrics (RSI, BBW, Strain), detects market regimes (A, B, C, D), and discovers structural DNA patterns. |
+| **3-Sec Scalp** | Utilizes 1-minute candle weather (Bullish/Bearish/Flat), SMI crossovers, MACD momentum, and tick-level Bollinger Bands for ultra-short setups. |
+| **Micro-Timing Engine** | Streams Step Index 100 ticks via the public Deriv WebSocket and calculates real-time microstructure features (normalized speed, streaks, delta change). |
+| **Real Execution Engine** | Master toggle to enable automated clicking of "Rise"/"Fall" and "Purchase" buttons with robust state management and outcome tracking via DOM observation. |
+| **Draggable Overlay** | Floating statistics panel showing real-time price, strategy confidence, DNA metrics, and session W/L performance. |
+| **CSV Export & Audit** | Export signal history and detailed Discovery Audit logs for rigorous performance analysis. |
 
 ---
 
-## How signals work (Mathematical Model)
+## Strategy Details
 
-1. **Feature Extraction**
-   - **Speed**: $delta\_steps / delta\_time\_ms$ (where 1 step = 0.1 price units).
-   - **Speed Trend**: Change in absolute speed (Acceleration vs. Deceleration).
-   - **Streaks**: Consecutive ticks in the same direction.
-   - **Epsilon**: Neutral momentum zone defined as $\pm 0.2$ steps.
+### 🧬 Discovery Evolution
+Uses a background worker (`dnaWorker.js`) to process rolling tick buffers and compute indicators (RSI, EMA, Standard Deviation, Bollinger Band Width, Strain). It categorizes market behavior into distinct "Regimes" (A=Consolidation, B=Trending, C=Volatility, D=Noise/Default). It records non-flat movement patterns and tracks their historical hit states, armed to strike when identical sequence and regime criteria align.
 
-2. **Adaptive Thresholds**
-   - $S_{high} = \max(p70, mean + std)$
-   - $S_{low} = \min(p30, mean - std)$
-
-3. **Strategy Hierachy**
-   - **Structural**: Enters on digit-set bias ({0,5,6} for BUY, {2,3,8} for SELL) aligned with delta change.
-   - **Hybrid**: Combines digit bias with momentum timing and early-streak confirmation.
-   - **Momentum**: Targets start of move. Requires Early Streak (0-2), positive speed trend, and speed *below* $S_{high}$.
-   - **Reversal**: Targets exhaustion. Requires Late Streak ($\ge 5$), negative speed trend, and speed *at or below* $S_{low}$.
-
-4. **Scoring & Bias**
-   - Price last digits act as a **bias filter/boost**, increasing or decreasing signal confidence.
-   - Signals are evaluated in order of priority: Structural $\to$ Hybrid $\to$ Momentum $\to$ Reversal.
+### ⚡ 3-Sec Scalp
+Monitors 1-minute candles via a secondary WebSocket feed to determine market "Weather" (Bullish, Bearish, or Flat). Tick-level entries are triggered by identifying Bollinger Band touches confirmed by Stochastic Momentum Index (SMI) crossovers and supportive MACD histogram momentum.
 
 ---
 
-## Installation (unpacked extension)
+## Real-Trade Execution Engine
+When the "Enable Real Execution" toggle is engaged, the extension transitions from a passive signal generator to an active execution agent:
+- Detects actionable signals.
+- Verifies cooldown timers to prevent rapid over-trading.
+- Automatically selects the correct "Rise" or "Fall" tab.
+- Simulates external clicks on the primary "Purchase" button.
+- Observes the Deriv `dc-flyout` DOM elements to track trade outcomes (WIN/LOSS) and accurately record PnL.
+- Halts real trading automatically upon encountering a LOSS as a capital protection safeguard.
+
+---
+
+## Installation (Unpacked Extension)
 
 1. **Download / clone this repository.**
 2. Open Chrome and go to `chrome://extensions`.
