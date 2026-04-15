@@ -1577,42 +1577,113 @@
     updateSignalsUI();
   }
   async function executeRealTrade(side) {
+    console.log(`[EXEC] Starting real trade sequence for ${side}`);
     // Double-failsafe: abort immediately if toggle was switched off between signal and execution
-    if (!cfg.realTradeEnabled) { realExecState = 'IDLE'; realLockReason = ''; updateRealUI(); return; }
-    if (Date.now() - lastRealTradeAt < cfg.realCooldownMs) return;
+    if (!cfg.realTradeEnabled) {
+      console.log(`[EXEC] Aborted: Real trade toggle is OFF`);
+      realExecState = 'IDLE'; realLockReason = ''; updateRealUI(); return;
+    }
+    if (Date.now() - lastRealTradeAt < cfg.realCooldownMs) {
+      console.log(`[EXEC] Aborted: Still in cooldown period`);
+      return;
+    }
+
     const buyLabel = side === 'BUY' ? 'Rise' : 'Fall', activeClass = side === 'BUY' ? CLASS_RISE_ACTIVE : CLASS_FALL_ACTIVE;
     try {
-      if (!await setRealTradeSide(buyLabel, activeClass)) throw new Error('side_failed');
-      if (!await waitRealBuyReady()) throw new Error('not_ready');
-      const btn = document.querySelector(SEL_PURCHASE_BTN); if (!btn || !btn.classList.contains(activeClass)) throw new Error('btn_mismatch');
-      simulateExternalClick(btn); lastRealTradeAt = Date.now();
+      console.log(`[EXEC] Attempting to set side to ${buyLabel} (expecting class: ${activeClass})`);
+      if (!await setRealTradeSide(buyLabel, activeClass)) {
+        throw new Error('side_failed');
+      }
+
+      console.log(`[EXEC] Waiting for purchase button to be ready...`);
+      if (!await waitRealBuyReady()) {
+        throw new Error('not_ready');
+      }
+
+      const btn = document.querySelector(SEL_PURCHASE_BTN);
+      if (!btn) {
+        throw new Error('btn_not_found');
+      }
+      if (!btn.classList.contains(activeClass)) {
+        throw new Error(`btn_mismatch: missing ${activeClass}`);
+      }
+
+      console.log(`[EXEC] Firing click event on purchase button!`);
+      simulateExternalClick(btn);
+      lastRealTradeAt = Date.now();
+
       const signalToMark = signals.find(s => s.result === 'PENDING' && s.isReal);
       realTrades.push({ time: Date.now(), signal: side, side: buyLabel, result: 'PENDING', signalRef: signalToMark, startTickIndex: null, confirmTime: null });
       if (realTrades.length > SESSION_HISTORY_CAP) realTrades.shift();
-      realExecTimer = setTimeout(() => { if (['OPEN_PENDING', 'OPEN'].includes(realExecState)) { realExecState = 'RECOVERY'; realLockReason = 'TIMEOUT'; updateRealUI(); } }, cfg.realTimeoutMs);
-    } catch (e) { realLockReason = 'ERR:' + e.message; updateRealUI(); setTimeout(() => { if (realExecState === 'OPEN_PENDING') { realExecState = 'IDLE'; realLockReason = ''; updateRealUI(); } }, 3000); }
+
+      realExecTimer = setTimeout(() => {
+        if (['OPEN_PENDING', 'OPEN'].includes(realExecState)) {
+          console.warn(`[EXEC] Trade resolution timeout reached (no flyout detected). Entering RECOVERY.`);
+          realExecState = 'RECOVERY'; realLockReason = 'TIMEOUT'; updateRealUI();
+        }
+      }, cfg.realTimeoutMs);
+
+    } catch (e) {
+      console.error(`[EXEC] Failed:`, e.message);
+      realLockReason = 'ERR:' + e.message;
+      updateRealUI();
+      setTimeout(() => {
+        if (realExecState === 'OPEN_PENDING') {
+          console.log(`[EXEC] Releasing lock back to IDLE after error`);
+          realExecState = 'IDLE'; realLockReason = ''; updateRealUI();
+        }
+      }, 3000);
+    }
   }
+
   async function setRealTradeSide(label, activeClass) {
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 5; i++) { // Increased retries from 3 to 5
       const btn = document.querySelector(SEL_PURCHASE_BTN);
-      if (btn && btn.classList.contains(activeClass)) return true;
+      if (btn && btn.classList.contains(activeClass)) {
+        console.log(`[EXEC] Side already correct (${label})`);
+        return true;
+      }
+
       const target = Array.from(document.querySelectorAll(SEL_SIDE_BTNS)).find(b => (b.textContent || '').includes(label));
       if (target) {
+        console.log(`[EXEC] Clicking side tab ${label} (Attempt ${i+1})`);
         simulateExternalClick(target);
-        await new Promise(r => setTimeout(r, 150)); // Faster response
+        await new Promise(r => setTimeout(r, 200)); // Increased wait time to 200ms to allow DOM paint
       } else {
-        await new Promise(r => setTimeout(r, 50));
+        console.warn(`[EXEC] Could not find side tab for ${label}`);
+        await new Promise(r => setTimeout(r, 100));
       }
     }
+    console.error(`[EXEC] Failed to set side to ${label} after 5 attempts`);
     return false;
   }
-  function simulateExternalClick(el) { const opts = { bubbles: true, cancelable: true, view: window }; el.dispatchEvent(new MouseEvent('mouseenter', opts)); el.dispatchEvent(new MouseEvent('mousedown', opts)); el.focus(); el.dispatchEvent(new MouseEvent('mouseup', opts)); el.dispatchEvent(new MouseEvent('click', opts)); el.dispatchEvent(new MouseEvent('mouseleave', opts)); }
+
+  function simulateExternalClick(el) {
+    const opts = { bubbles: true, cancelable: true, view: window };
+    el.dispatchEvent(new MouseEvent('mouseenter', opts));
+    el.dispatchEvent(new MouseEvent('mousedown', opts));
+    el.focus();
+    el.dispatchEvent(new MouseEvent('mouseup', opts));
+    el.dispatchEvent(new MouseEvent('click', opts));
+    el.dispatchEvent(new MouseEvent('mouseleave', opts));
+  }
+
   async function waitRealBuyReady() {
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 10; i++) { // Increased retries from 5 to 10
       const btn = document.querySelector(SEL_PURCHASE_BTN);
-      if (btn && btn.getAttribute('data-loading') !== 'true' && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true') return true;
-      await new Promise(r => setTimeout(r, 100)); // Shorter wait increments
+      if (btn) {
+        const isLoading = btn.getAttribute('data-loading') === 'true';
+        const isDisabledAttr = btn.getAttribute('aria-disabled') === 'true';
+        if (!isLoading && !btn.disabled && !isDisabledAttr) {
+           return true;
+        }
+        console.log(`[EXEC] Button not ready (loading: ${isLoading}, disabled: ${btn.disabled}, aria-disabled: ${isDisabledAttr}). Waiting...`);
+      } else {
+        console.warn(`[EXEC] Purchase button completely missing during wait check`);
+      }
+      await new Promise(r => setTimeout(r, 100)); // Wait 100ms between checks
     }
+    console.error(`[EXEC] Purchase button never became ready`);
     return false;
   }
   function initIndexedDB() {
